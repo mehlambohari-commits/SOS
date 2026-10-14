@@ -1,0 +1,28 @@
+# Python virtual environment
+.venv/
+
+# Environment variables / secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Distribution / build files
+build/
+dist/
+*.egg-info/
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
+EP poster.jpg
+EP ppt.pdf
+aisa_rl_dataset.csv
+aisa_q_table.npy
