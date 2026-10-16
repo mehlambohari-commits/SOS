@@ -9,6 +9,7 @@ Keys (click the AISA window first):
     ENTER   confirm the call was answered (manual_key mode)
     X       end the current call session
     F       toggle fullscreen
+    D       show live finger numbers (for tuning)
 
 Dataset (for the ML step later)
     Every frame that contains a hand is converted into DATA:
@@ -410,16 +411,116 @@ def calculate_reward(hand_detected, fingers, confidence, stable, hold_time, acti
 # ============================================================
 # DATASET BEGIN
 
-def finger_states(landmarks):
-    """[thumb, index, middle, ring, pinky] -> True when extended."""
-    lm = landmarks.landmark
+# ---- finger detection tuning ---------------------------------
+# Press D in the AISA window to see the live numbers for each
+# finger, then adjust these if one finger is read wrongly.
+FINGER_STRAIGHT_ANGLE = 145.0   # degrees at the middle knuckle (bigger = stricter)
+THUMB_REACH_RATIO = 1.15        # bigger = thumb must be spread further out
+THUMB_STRAIGHT_ANGLE = 125.0
 
-    states = [lm[4].x < lm[3].x]
+FINGER_SMOOTH_FRAMES = 7        # majority vote over the last N frames
+HAND_LOST_GRACE = 0.4           # seconds a lost hand may flicker without
+                                # resetting the hold timer
 
-    for tip, joint in ((8, 6), (12, 10), (16, 14), (20, 18)):
-        states.append(lm[tip].y < lm[joint].y)
 
-    return states
+def _landmark_points(landmarks, w, h):
+    # pixel units (not 0..1) so angles are not stretched by the 4:3 image
+    return np.array(
+        [[p.x * w, p.y * h, p.z * w] for p in landmarks.landmark],
+        dtype=np.float32,
+    )
+
+
+def _angle(a, b, c):
+    """angle at point b (degrees) between the lines b->a and b->c"""
+    v1, v2 = a - b, c - b
+    n = np.linalg.norm(v1) * np.linalg.norm(v2)
+
+    if n < 1e-6:
+        return 0.0
+
+    return float(np.degrees(np.arccos(np.clip(np.dot(v1, v2) / n, -1.0, 1.0))))
+
+
+def finger_states_debug(landmarks, w=640, h=480):
+    """
+    Returns ([thumb, index, middle, ring, pinky] extended?, debug lines).
+
+    The old rule compared x / y positions ("tip is above the joint",
+    "thumb tip is left of the thumb joint"). That only works for an
+    upright right hand with the palm facing the camera.
+
+    This one only uses angles and distances between joints, which do
+    not change when the hand is rotated, mirrored (left hand) or
+    turned around (back of the hand):
+
+      finger  extended = the finger is straight (angle at the middle
+                         knuckle is large) AND the tip is farther
+                         from the wrist than that knuckle
+      thumb   extended = the tip is far from the base of the little
+                         finger (spread out, not tucked over the palm)
+                         AND the thumb is not sharply bent
+    """
+    p = _landmark_points(landmarks, w, h)
+
+    def dist(i, j):
+        return float(np.linalg.norm(p[i] - p[j]))
+
+    states, info = [], []
+
+    reach = dist(4, 17) / max(dist(2, 17), 1e-6)
+    angle = _angle(p[2], p[3], p[4])
+    up = reach >= THUMB_REACH_RATIO and angle >= THUMB_STRAIGHT_ANGLE
+
+    states.append(up)
+    info.append(f"Thumb   reach {reach:4.2f}  angle {angle:3.0f}   {'UP' if up else '--'}")
+
+    joints = (("Index", 5, 6, 8), ("Middle", 9, 10, 12),
+              ("Ring", 13, 14, 16), ("Pinky", 17, 18, 20))
+
+    for name, mcp, pip, tip in joints:
+        angle = _angle(p[mcp], p[pip], p[tip])
+        reach = dist(0, tip) / max(dist(0, pip), 1e-6)
+        up = angle >= FINGER_STRAIGHT_ANGLE and reach > 1.0
+
+        states.append(up)
+        info.append(f"{name:7s} reach {reach:4.2f}  angle {angle:3.0f}   {'UP' if up else '--'}")
+
+    return states, info
+
+
+def finger_states(landmarks, w=640, h=480):
+    return finger_states_debug(landmarks, w, h)[0]
+
+
+class FingerSmoother:
+    """
+    A finger count only changes when the new value wins a majority of the
+    last few frames, so a single misread frame cannot reset the 5 second
+    hold (and therefore cannot stop the call from ever triggering).
+    """
+
+    def __init__(self, size=FINGER_SMOOTH_FRAMES):
+        self.buffer = deque(maxlen=size)
+        self.current = 0
+
+    def update(self, value):
+        self.buffer.append(value)
+
+        counts = {}
+        for v in self.buffer:
+            counts[v] = counts.get(v, 0) + 1
+
+        best, votes = max(counts.items(), key=lambda kv: kv[1])
+
+        if votes > len(self.buffer) // 2 or self.current not in counts:
+            self.current = best
+
+        return self.current
+
+    def clear(self):
+        self.buffer.clear()
+        self.current = 0
 
 
 def calculate_hand_confidence(landmarks):
@@ -972,15 +1073,16 @@ class UI:
         self.text("CONTROLS", LEFT_X + 18, STATUS_Y + 18, 10, C["muted"], True)
 
         keys = [("ESC", "Quit"), ("ENTER", "Answered"),
-                ("X", "End session"), ("F", "Fullscreen")]
+                ("X", "End session"), ("F", "Fullscreen"),
+                ("D", "Finger debug")]
 
         for i, (k, d) in enumerate(keys):
             kx = LEFT_X + 18 + (i % 2) * 130
-            ky = STATUS_Y + 44 + (i // 2) * 34
+            ky = STATUS_Y + 40 + (i // 2) * 24
 
             kw = measure(k, 11, True) + 14
-            fill_rrect(cv, kx, ky - 11, kw, 22, 6, C["card"], 1.0)
-            rr_outline(cv, kx, ky - 11, kw, 22, 6, C["border"], 1)
+            fill_rrect(cv, kx, ky - 10, kw, 20, 6, C["card"], 1.0)
+            rr_outline(cv, kx, ky - 10, kw, 20, 6, C["border"], 1)
 
             self.text(k, kx + kw / 2, ky, 11, C["text"], True, "mm")
             self.text(d, kx + kw + 7, ky, 11, C["text2"])
@@ -1129,6 +1231,20 @@ class UI:
             self.chip(CAM_X + CAM_W - 26, CAM_Y + 24, "HAND DETECTED", C["green"], 11, "r", dot=True, h=22)
         else:
             self.chip(CAM_X + CAM_W - 26, CAM_Y + 24, "NO HAND", C["muted"], 11, "r", dot=True, h=22)
+
+        # live finger numbers (D key)
+        dbg = s.get("debug")
+
+        if dbg:
+            bh = 16 + len(dbg) * 18
+            bx, by = CAM_X + 28, CAM_Y + CAM_H - bh - 28
+
+            fill_rrect(cv, bx, by, 330, bh, 12, C["dark"], 0.85)
+            rr_outline(cv, bx, by, 330, bh, 12, C["border"], 1)
+
+            for k, line in enumerate(dbg):
+                col = C["green"] if line.rstrip().endswith("UP") else C["text2"]
+                self.text(line, bx + 14, by + 16 + k * 18, 11, col)
 
         # call banner
         label = s["call_label"]
@@ -2023,6 +2139,10 @@ frame_index = 0
 last_frame_time = time.time()
 fps = 0.0
 
+smoother = FingerSmoother()
+lost_time = 0.0          # how long the hand has been missing
+debug_hud = False        # toggled with the D key
+
 
 # ============================================================
 # MAIN LOOP
@@ -2052,6 +2172,8 @@ while cap.isOpened():
 
     hand_detected = False
     fingers = 0
+    raw_fingers = 0
+    finger_info = []
     states = [False] * 5
     confidence = 0.0
     landmarks = None
@@ -2065,8 +2187,11 @@ while cap.isOpened():
         if results.multi_handedness:
             handedness = results.multi_handedness[0].classification[0].label
 
-        states = finger_states(landmarks)
-        fingers = min(sum(states), 5)
+        states, finger_info = finger_states_debug(
+            landmarks, frame.shape[1], frame.shape[0]
+        )
+        raw_fingers = min(sum(states), 5)
+        fingers = smoother.update(raw_fingers)
         confidence = calculate_hand_confidence(landmarks)
         features = landmark_features(landmarks)
 
@@ -2077,15 +2202,20 @@ while cap.isOpened():
     # GESTURE STABILITY (real seconds)
     # --------------------------------------------------------
 
+    lost_time = 0.0 if hand_detected else lost_time + dt
+
     if hand_detected:
         if fingers == previous_fingers:
             gesture_stable_time += dt
         else:
             gesture_stable_time = 0.0
             previous_fingers = fingers
-    else:
+
+    elif lost_time > HAND_LOST_GRACE:
+        # hand really gone (not just one missed frame)
         gesture_stable_time = 0.0
         previous_fingers = 0
+        smoother.clear()
 
     stable = gesture_stable_time >= 0.4
 
@@ -2178,7 +2308,7 @@ while cap.isOpened():
         status = f"Confirm {label}  -  keep {confirmed_fingers} finger{'s' if confirmed_fingers != 1 else ''} up"
         status_color = C["green"]
 
-        if not hand_detected or fingers != confirmed_fingers:
+        if lost_time > HAND_LOST_GRACE or (hand_detected and fingers != confirmed_fingers):
             confirming = False
             confirmed_fingers = 0
             gesture_stable_time = 0.0
@@ -2242,6 +2372,10 @@ while cap.isOpened():
         "recording": recording,
         "rec_elapsed": rec_elapsed,
         "fps": fps,
+        "debug": (
+            (finger_info + [f"raw count {raw_fingers}  ->  stable count {fingers}"])
+            if (debug_hud and hand_detected) else None
+        ),
     })
 
     cv2.imshow(WINDOW_NAME, canvas)
@@ -2263,6 +2397,9 @@ while cap.isOpened():
     elif key in (ord("x"), ord("X")):               # end session
         if call_in_progress:
             assistant_running = False
+
+    elif key in (ord("d"), ord("D")):               # debug overlay
+        debug_hud = not debug_hud
 
     elif key in (ord("f"), ord("F")):               # fullscreen
         is_fullscreen = not is_fullscreen
