@@ -10,14 +10,27 @@ Keys (click the AISA window first):
     X       end the current call session
     F       toggle fullscreen
     D       show live finger numbers (for tuning)
+    0-5     TEACH MODE (for building the training data, see below)
 
 Dataset (for the ML step later)
     Every frame that contains a hand is converted into DATA:
     21 hand landmarks -> 63 numbers, normalised so they do not
     depend on where the hand is or how far it is from the camera.
     Saved to  aisa_gesture_dataset.csv  together with the label
-    (what the user wanted) so a model can be trained on it later.
-    The ML code is at the bottom of the file, commented out.
+    (what the user wanted) so a model can be trained on it.
+
+ML (what does the user want?)
+    At start-up a Random Forest is trained from the dataset of EARLIER
+    sessions. It looks at the hand shape and predicts the service
+    (Police / Fire / Ambulance / Women Helpline / General Helpline /
+    none). It is advisory: it never starts or blocks a call.
+    This session's rows are saved but not used until the next start.
+
+TEACH MODE (developer / data collection only)
+    Press 1-5 and show that gesture: every frame is saved with that
+    true label. Press 0 and show other hand shapes: label "none".
+    Press the same key again to stop. Calls are disabled while
+    teaching. Once the model is trained, normal use needs no keys.
 """
 
 import cv2
@@ -105,8 +118,16 @@ RESET_DATASET_ON_START = False
 # Save one row every N frames that contain a hand
 SAMPLE_EVERY_N_FRAMES = 2
 
-# --- ML (the code is commented out at the bottom of the file) --
-ML_ENABLED = False
+# --- ML: "what does the user want?" -------------------------------
+# Needs:  pip install scikit-learn
+ML_ENABLED = True
+ML_MODEL_FILE = "aisa_gesture_model.joblib"
+ML_MIN_ROWS_PER_CLASS = 40      # a gesture needs at least this many rows
+ML_MIN_TRUE_ROWS = 150          # teach-mode rows needed to prefer them
+ML_MAX_TRAIN_ROWS = 40000       # keeps start-up training fast
+ML_TREES = 80
+ML_PREDICT_EVERY = 3            # predict every N frames (keeps FPS up)
+ML_MIN_PROBABILITY = 0.70       # below this the HUD shows "unsure"
 
 
 # ============================================================
@@ -197,7 +218,7 @@ emergency_numbers = {
     2: "9335587271",
     3: "8878010010",
     4: "8793796952",
-    5: "6232481125",
+    5: "9552378652",
 }
 
 emergency_labels = {
@@ -274,11 +295,6 @@ call_answered_event = threading.Event()
 # everything shown in the assistant panel: (speaker, text)
 # speakers: "AISA", "YOU", "CALL" (said to responder), "SYSTEM"
 chat_log = deque(maxlen=40)
-
-# ML status shown in the HUD (see ML block at the bottom)
-ml_status = "OFF"
-ml_prediction = ""
-
 
 # ============================================================
 # RL ACTIONS
@@ -568,8 +584,9 @@ DATASET_META_COLUMNS = [
     "timestamp", "session_id", "frame", "event", "handedness",
     "fingers", "thumb", "index", "middle", "ring", "pinky",
     "hand_conf", "stable", "hold_time",
-    "label", "valid_gesture",
+    "label", "true_label", "valid_gesture",
     "rl_action", "rl_reward",
+    "ml_label", "ml_prob",
     "call_in_progress", "test_mode",
 ]
 
@@ -590,6 +607,31 @@ class DatasetLogger:
         self.total_rows = 0
         self.session_id = int(time.time())
 
+    def _upgrade_columns(self):
+        """older files miss the newer columns (true_label, ml_*):
+        add them and keep every existing row"""
+        with open(self.path, "r", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+
+            if header is None or header == DATASET_COLUMNS:
+                return
+
+            old = [dict(zip(header, r)) for r in reader]
+
+        tmp = self.path + ".tmp"
+
+        with open(tmp, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(DATASET_COLUMNS)
+
+            for row in old:
+                writer.writerow([row.get(c, "") for c in DATASET_COLUMNS])
+
+        os.replace(tmp, self.path)
+
+        print(f"Upgraded {self.path} to the new column layout ({len(old)} rows kept).")
+
     def open(self, reset=False):
         # remove datasets from older versions
         for old in LEGACY_DATASET_FILES:
@@ -607,7 +649,15 @@ class DatasetLogger:
             except Exception as error:
                 print("Could not delete", self.path, "-", error)
 
-        exists = os.path.exists(self.path)
+        exists = os.path.exists(self.path) and os.path.getsize(self.path) > 0
+
+        if exists:
+            try:
+                self._upgrade_columns()
+            except Exception as error:
+                print("Could not upgrade the dataset format:", error)
+                self.path = f"aisa_gesture_dataset_{self.session_id}.csv"
+                exists = False
 
         if exists:
             try:
@@ -636,7 +686,8 @@ class DatasetLogger:
 
     def log(self, event, frame_index, handedness, states, fingers,
             confidence, stable, hold_time, label, valid_gesture,
-            rl_action, rl_reward, features):
+            rl_action, rl_reward, features,
+            true_label="", ml_label="", ml_prob=0.0):
 
         if self.writer is None:
             return
@@ -655,9 +706,12 @@ class DatasetLogger:
             int(stable),
             round(hold_time, 3),
             label,
+            true_label,
             int(valid_gesture),
             actions[rl_action],
             rl_reward,
+            ml_label,
+            round(float(ml_prob), 3),
             int(call_in_progress),
             int(TEST_MODE),
             *[round(float(v), 5) for v in features],
@@ -685,6 +739,241 @@ class DatasetLogger:
 
 dataset = DatasetLogger(DATASET_FILE)
 dataset.open(reset=RESET_DATASET_ON_START)
+
+
+# ============================================================
+# ML  -  WHAT DOES THE USER WANT?
+# ============================================================
+#
+# Predicts WHICH SERVICE the user is asking for (Police, Fire,
+# Ambulance, Women Helpline, General Helpline, or "none") from the
+# shape of the hand: the 63 landmark numbers + a left/right flag.
+#
+# Session flow:
+#   start-up   -> train from the dataset of EARLIER sessions only
+#   running    -> use that model (advisory: it never blocks a call)
+#                 and keep SAVING new rows, which are NOT used yet
+#   next start -> those rows are now "earlier sessions" and are used
+#
+# Labels it learns from:
+#   - your teach-mode labels (keys 0-5) if there are enough of them
+#   - otherwise the rule-made "label" column. The model then mostly
+#     copies the rule, so use teach mode once to give it real answers.
+#
+# Columns used:   lm0_x ... lm20_z (63) + handedness   -> the input
+#                 true_label (or label)                -> the answer
+#                 event == "frame"                      -> which rows
+#                 session_id                            -> honest test split
+# Not used:       fingers/thumb..pinky, stable, hold_time, valid_gesture,
+#                 rl_*: these come from the rule or from timing, so the
+#                 model would just copy them instead of learning the hand.
+# ============================================================
+# ML BEGIN
+
+try:
+    import joblib
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import GroupShuffleSplit
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
+
+ml_status = "OFF"        # OFF | NO DATA | TRAINING | READY 94% | ERROR
+ml_predictor = None
+
+
+def load_previous_sessions(path, current_session):
+    """Read the CSV once. Rows written by THIS session are ignored."""
+    if not os.path.exists(path):
+        return None
+
+    X, left, true, pseudo, fingers, sessions = [], [], [], [], [], []
+
+    with open(path, "r", newline="") as f:
+        for row in csv.DictReader(f):
+
+            if row.get("event") != "frame":
+                continue
+
+            if row.get("session_id") == str(current_session):
+                continue
+
+            try:
+                feats = [float(row[c]) for c in DATASET_LM_COLUMNS]
+                finger_count = int(float(row.get("fingers") or 0))
+            except (ValueError, KeyError, TypeError):
+                continue
+
+            X.append(feats)
+            left.append(1.0 if row.get("handedness") == "Left" else 0.0)
+            true.append(row.get("true_label") or "")
+            pseudo.append(row.get("label") or "none")
+            fingers.append(finger_count)
+            sessions.append(row.get("session_id") or "")
+
+    if not X:
+        return None
+
+    return {
+        "X": np.hstack([np.array(X, np.float32), np.array(left, np.float32)[:, None]]),
+        "true": np.array(true),
+        "pseudo": np.array(pseudo),
+        "fingers": np.array(fingers),
+        "sessions": np.array(sessions),
+    }
+
+
+def _choose_target(data):
+    """returns (labels, usable-row mask or None, description)"""
+    true = data["true"]
+    true_mask = true != ""
+
+    if true_mask.sum() >= ML_MIN_TRUE_ROWS and len(np.unique(true[true_mask])) >= 2:
+        y, mask = true, true_mask.copy()
+        source = "your teach-mode labels"
+    else:
+        y, mask = data["pseudo"], np.ones(len(true), dtype=bool)
+        source = ("rule-made labels (the model will mostly copy the rule - "
+                  "use teach mode for real labels)")
+
+    classes, counts = np.unique(y[mask], return_counts=True)
+    keep = [c for c, n in zip(classes, counts) if n >= ML_MIN_ROWS_PER_CLASS]
+
+    if len(keep) < 2:
+        return y, None, source
+
+    mask &= np.isin(y, keep)
+
+    return y, mask, source
+
+
+class GesturePredictor:
+
+    def __init__(self, model):
+        self.model = model
+
+    def predict(self, features, handedness):
+        """returns (label, probability)"""
+        x = np.concatenate(
+            [features, [1.0 if handedness == "Left" else 0.0]]
+        ).astype(np.float32)[None, :]
+
+        probs = self.model.predict_proba(x)[0]
+        best = int(np.argmax(probs))
+
+        return str(self.model.classes_[best]), float(probs[best])
+
+
+def _make_forest():
+    return RandomForestClassifier(
+        n_estimators=ML_TREES,
+        class_weight="balanced",
+        min_samples_leaf=2,
+        n_jobs=1,
+        random_state=0,
+    )
+
+
+def _train_ml(data):
+    global ml_status, ml_predictor
+
+    try:
+        y_all, mask, source = _choose_target(data)
+
+        if mask is None:
+            ml_status = "NO DATA"
+            print("\nML: not enough labelled rows yet "
+                  f"(need {ML_MIN_ROWS_PER_CLASS}+ per gesture, 2+ gestures).")
+            return
+
+        idx = np.where(mask)[0]
+
+        if len(idx) > ML_MAX_TRAIN_ROWS:
+            rng = np.random.default_rng(0)
+            idx = np.sort(rng.choice(idx, ML_MAX_TRAIN_ROWS, replace=False))
+
+        X = data["X"][idx]
+        y = y_all[idx]
+        sessions = data["sessions"][idx]
+        rule = np.array([emergency_labels.get(int(f), "none") for f in data["fingers"][idx]])
+
+        # honest check: test on sessions the model has NOT seen
+        # (neighbouring frames are near-copies, a random split would cheat)
+        if len(set(sessions)) >= 2:
+            tr, te = next(GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=0)
+                          .split(X, y, groups=sessions))
+            how = f"{len(set(sessions[te]))} unseen session(s)"
+        else:
+            cut = int(len(idx) * 0.75)
+            tr, te = np.arange(cut), np.arange(cut, len(idx))
+            how = "the last 25% of the only session"
+
+        acc = rule_acc = None
+
+        if len(te) and len(set(y[tr])) >= 2:
+            check = _make_forest().fit(X[tr], y[tr])
+            acc = float(np.mean(check.predict(X[te]) == y[te]))
+            rule_acc = float(np.mean(rule[te] == y[te]))
+
+        model = _make_forest().fit(X, y)
+
+        try:
+            joblib.dump(model, ML_MODEL_FILE)
+        except Exception:
+            pass
+
+        ml_predictor = GesturePredictor(model)
+        ml_status = f"READY {acc:.0%}" if acc is not None else "READY"
+
+        classes, counts = np.unique(y, return_counts=True)
+
+        print("\n" + "-" * 50)
+        print("ML model trained from earlier sessions")
+        print("  labels used :", source)
+        print("  rows        :", len(idx), " ", dict(zip(classes.tolist(), counts.tolist())))
+
+        if acc is not None:
+            print(f"  accuracy    : {acc:.1%} on {how}")
+            print(f"  rule alone  : {rule_acc:.1%} on the same rows")
+
+        print("-" * 50)
+
+    except Exception as error:
+        ml_status = "ERROR"
+        print("ML training failed:", error)
+
+
+def start_ml(path, session_id):
+    global ml_status
+
+    if not ML_ENABLED:
+        ml_status = "OFF"
+        return
+
+    if not SKLEARN_OK:
+        ml_status = "OFF"
+        print("\nML is off: run  pip install scikit-learn")
+        return
+
+    print("\nML: loading earlier sessions...")
+
+    data = load_previous_sessions(path, session_id)
+
+    if data is None:
+        ml_status = "NO DATA"
+        print("ML: no earlier data yet. This session collects it; "
+              "the model trains next time.")
+        return
+
+    ml_status = "TRAINING"
+
+    # in the background, so the camera opens straight away
+    threading.Thread(target=_train_ml, args=(data,), daemon=True).start()
+
+# ML END
+
+
+start_ml(dataset.path, dataset.session_id)
 
 
 # ============================================================
@@ -1074,7 +1363,7 @@ class UI:
 
         keys = [("ESC", "Quit"), ("ENTER", "Answered"),
                 ("X", "End session"), ("F", "Fullscreen"),
-                ("D", "Finger debug")]
+                ("D", "Finger debug"), ("0-5", "Teach labels")]
 
         for i, (k, d) in enumerate(keys):
             kx = LEFT_X + 18 + (i % 2) * 130
@@ -1232,6 +1521,12 @@ class UI:
         else:
             self.chip(CAM_X + CAM_W - 26, CAM_Y + 24, "NO HAND", C["muted"], 11, "r", dot=True, h=22)
 
+        # teach mode banner
+        if s.get("teach") is not None:
+            t_text = f"TEACHING: {s['teach']}"
+            t_w = measure(t_text, 11, True) + 22 + 14
+            self.chip(CAM_X + (CAM_W - t_w) // 2, CAM_Y + 24, t_text, C["amber"], 11, dot=True, h=22)
+
         # live finger numbers (D key)
         dbg = s.get("debug")
 
@@ -1288,17 +1583,23 @@ class UI:
         frac = s["stable_time"] / s["hold_target"] if s["hand_detected"] else 0.0
         self.bar(x, y + 44, CAM_W - 48, 12, frac, s["status_color"])
 
+        agree = s["ml_agree"]
+        ml_col = C["green"] if agree is True else (C["amber"] if agree is False else C["text2"])
+
         tiles = [
-            ("FINGERS", str(s["fingers"])),
-            ("CONFIDENCE", f"{s['confidence']:.2f}"),
-            ("HOLD", f"{s['stable_time']:.1f}s / {s['hold_target']:.1f}s"),
-            ("RL ACTION", s["rl_action"]),
+            (0,   "FINGERS", str(s["fingers"]), C["text"], 16),
+            (88,  "CONFIDENCE", f"{s['confidence']:.2f}", C["text"], 16),
+            (184, "HOLD", f"{s['stable_time']:.1f}s / {s['hold_target']:.1f}s", C["text"], 16),
+            (300, "RL ACTION", s["rl_action"], C["text"], 16),
+            (404, "ML SAYS", s["ml_pred"], ml_col, 15),
         ]
 
-        for i, (label, value) in enumerate(tiles):
-            tx = x + i * 150
-            self.text(label, tx, y + 72, 10, C["muted"], True)
-            self.text(value, tx, y + 92, 16, C["text"], True)
+        for off, label, value, col, size in tiles:
+            while measure(value, size, True) > 184 and size > 11:
+                size -= 1
+
+            self.text(label, x + off, y + 72, 10, C["muted"], True)
+            self.text(value, x + off, y + 92, size, col, True)
 
     def _assistant(self, s, pulse):
         cv = self.canvas
@@ -1404,7 +1705,9 @@ class UI:
             ("GEMINI", gem, gem_col),
             ("CALL ANSWER", s["answer_mode"].replace("_", " "), C["text"]),
             ("DATASET", f"{s['dataset_rows']:,} rows", C["cyan"]),
-            ("ML MODEL", s["ml_text"], C["muted"] if s["ml_text"] == "OFF" else C["green"]),
+            ("ML MODEL", s["ml_status"],
+             C["green"] if s["ml_status"].startswith("READY")
+             else (C["amber"] if s["ml_status"] == "TRAINING" else C["muted"])),
         ]
 
         for i, (label, value, col) in enumerate(tiles):
@@ -2022,94 +2325,6 @@ def call_emergency(fingers):
 
 
 # ============================================================
-# ML  -  GESTURE INTENT MODEL        (DISABLED FOR NOW)
-# ============================================================
-#
-# Plan: use the dataset above (63 landmark numbers -> label) to teach
-# a model what the user wants, then use it next to the rule-based
-# finger counter.
-#
-# To enable:
-#   1. collect data by using the app normally (several minutes per
-#      gesture, different distances / angles / lighting / people)
-#   2. uncomment this block
-#   3. run  train_gesture_model()  once  (python -c, or temporarily
-#      call it before the main loop)
-#   4. set ML_ENABLED = True at the top
-#   5. uncomment the two "ML:" lines inside the main loop
-#
-# ------------------------------------------------------------
-# import joblib
-# import pandas as pd
-# from sklearn.ensemble import RandomForestClassifier
-# from sklearn.model_selection import train_test_split
-# from sklearn.metrics import classification_report
-#
-# ML_MODEL_FILE = "aisa_gesture_model.joblib"
-# ML_MIN_PROBABILITY = 0.80
-#
-#
-# def train_gesture_model():
-#     df = pd.read_csv(DATASET_FILE)
-#
-#     # only the per-frame rows, not the call-trigger events
-#     df = df[df["event"] == "frame"]
-#
-#     feature_cols = DATASET_LM_COLUMNS
-#     X = df[feature_cols].values
-#     y = df["label"].values            # "Police", "Fire", ..., "none"
-#
-#     print("Rows:", len(df))
-#     print(df["label"].value_counts())
-#
-#     X_train, X_test, y_train, y_test = train_test_split(
-#         X, y, test_size=0.2, random_state=42, stratify=y
-#     )
-#
-#     model = RandomForestClassifier(
-#         n_estimators=200,
-#         random_state=42,
-#         class_weight="balanced",
-#     )
-#
-#     model.fit(X_train, y_train)
-#
-#     print(classification_report(y_test, model.predict(X_test)))
-#
-#     joblib.dump(model, ML_MODEL_FILE)
-#     print("Model saved:", ML_MODEL_FILE)
-#
-#
-# class GesturePredictor:
-#
-#     def __init__(self, path=ML_MODEL_FILE):
-#         self.model = None
-#
-#         if os.path.exists(path):
-#             self.model = joblib.load(path)
-#             print("ML model loaded:", path)
-#         else:
-#             print("No ML model found - run train_gesture_model() first.")
-#
-#     def predict(self, features):
-#         """returns (label, probability)"""
-#         if self.model is None:
-#             return "", 0.0
-#
-#         probs = self.model.predict_proba([features])[0]
-#         best = int(np.argmax(probs))
-#
-#         return self.model.classes_[best], float(probs[best])
-#
-#
-# ml_predictor = GesturePredictor() if ML_ENABLED else None
-#
-# if ML_ENABLED and ml_predictor and ml_predictor.model is not None:
-#     ml_status = "READY"
-# ------------------------------------------------------------
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
@@ -2122,7 +2337,10 @@ print("HOLD TIME:", HOLD_TIME, "seconds")
 print("Q-table:", Q_TABLE_FILE)
 print("Dataset:", dataset.path)
 print("Gemini:", gemini_model if gemini_model else "NOT AVAILABLE")
-print("\nShow 1-5 fingers. ESC to exit.\n")
+print("ML:", ml_status)
+print("\nShow 1-5 fingers. ESC to exit.")
+print("Teach mode (building the dataset): press 1-5 / 0 to record a label, "
+      "same key again to stop. Calls are disabled while teaching.\n")
 
 calibrate_microphone()
 
@@ -2142,6 +2360,9 @@ fps = 0.0
 smoother = FingerSmoother()
 lost_time = 0.0          # how long the hand has been missing
 debug_hud = False        # toggled with the D key
+ml_label = ""            # what the ML model thinks the user wants
+ml_prob = 0.0
+teach_label = None       # None, or the label being taught (keys 0-5)
 
 
 # ============================================================
@@ -2220,11 +2441,32 @@ while cap.isOpened():
     stable = gesture_stable_time >= 0.4
 
     # --------------------------------------------------------
-    # ML (disabled)
+    # ML: what does the user want?  (advisory only)
     # --------------------------------------------------------
-    # ML: if ML_ENABLED and features is not None:
-    # ML:     ml_label, ml_prob = ml_predictor.predict(features)
-    # ML:     ml_prediction = f"{ml_label} {ml_prob:.0%}"
+
+    if (
+        ml_predictor is not None
+        and features is not None
+        and frame_index % ML_PREDICT_EVERY == 0
+    ):
+        try:
+            ml_label, ml_prob = ml_predictor.predict(features, handedness)
+        except Exception as error:
+            print("ML predict error:", error)
+            ml_label, ml_prob = "", 0.0
+
+    if not hand_detected and lost_time > HAND_LOST_GRACE:
+        ml_label, ml_prob = "", 0.0
+
+    rule_label = emergency_labels.get(fingers, "none") if hand_detected else ""
+
+    if ml_label and ml_prob >= ML_MIN_PROBABILITY:
+        ml_text = f"{ml_label}  {ml_prob:.0%}"
+        ml_agree = (ml_label == rule_label) if rule_label else None
+    elif ml_label:
+        ml_text, ml_agree = "unsure", None
+    else:
+        ml_text, ml_agree = "-", None
 
     # --------------------------------------------------------
     # REINFORCEMENT LEARNING
@@ -2259,6 +2501,7 @@ while cap.isOpened():
             "frame", frame_index, handedness, states, fingers,
             confidence, stable, gesture_stable_time, label, valid_gesture,
             action, reward, features,
+            true_label=teach_label or "", ml_label=ml_label, ml_prob=ml_prob,
         )
 
     # --------------------------------------------------------
@@ -2286,6 +2529,10 @@ while cap.isOpened():
         status = f"Call in progress  -  {current_call_label}  (gestures paused)"
         status_color = C["amber"]
 
+    elif teach_label is not None:
+        status = f"TEACH MODE  -  recording '{teach_label}'  (calls disabled)"
+        status_color = C["amber"]
+
     # --------------------------------------------------------
     # SAFETY TRIGGER (RL does not decide whether a valid gesture may call)
     # --------------------------------------------------------
@@ -2294,6 +2541,7 @@ while cap.isOpened():
         valid_gesture
         and not confirming
         and not call_in_progress
+        and teach_label is None
         and time.time() - last_call_time >= call_cooldown
     ):
         confirming = True
@@ -2323,6 +2571,7 @@ while cap.isOpened():
                 confidence, True, gesture_stable_time, label, True,
                 ACTION_TRIGGER, 10,
                 features if features is not None else [0.0] * 63,
+                ml_label=ml_label, ml_prob=ml_prob,
             )
 
             confirming = False
@@ -2367,7 +2616,10 @@ while cap.isOpened():
         "gemini_model": gemini_model,
         "answer_mode": CALL_ANSWER_MODE,
         "dataset_rows": dataset.total_rows,
-        "ml_text": ml_prediction or ml_status,
+        "ml_status": ml_status,
+        "ml_pred": ml_text,
+        "ml_agree": ml_agree,
+        "teach": teach_label,
         "test_mode": TEST_MODE,
         "recording": recording,
         "rec_elapsed": rec_elapsed,
@@ -2397,6 +2649,19 @@ while cap.isOpened():
     elif key in (ord("x"), ord("X")):               # end session
         if call_in_progress:
             assistant_running = False
+
+    elif ord("0") <= key <= ord("5"):               # teach mode (data collection)
+        if not call_in_progress:
+            chosen = "none" if key == ord("0") else emergency_labels[key - ord("0")]
+            teach_label = None if teach_label == chosen else chosen
+            print("TEACH MODE:", teach_label if teach_label else "off")
+
+            # the hold must be earned again after teaching, otherwise
+            # switching teach mode off with the hand still up would
+            # start a real call at once
+            gesture_stable_time = 0.0
+            confirming = False
+            confirmed_fingers = 0
 
     elif key in (ord("d"), ord("D")):               # debug overlay
         debug_hud = not debug_hud
